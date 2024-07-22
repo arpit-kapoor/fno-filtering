@@ -1,0 +1,12 @@
+#!/bin/bash
+
+#PBS -N train_fno_filtering
+#PBS -l select=1:ncpus=4:mem=46gb:ngpus=1
+#PBS -l walltime=2:00:00 
+#PBS -M arpit.kapoor@unsw.edu.au 
+#PBS -m ae
+#PBS -j oe
+
+cd $PBS_O_WORKDIR
+
+/home/z5370003/venvs/torch-env/bin/python train_fno.py
