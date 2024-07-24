@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
-
 import os
 import torch
 import torch.nn.functional as F
@@ -13,6 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from scipy.stats import norm, multivariate_normal
+from sklearn.metrics import r2_score, root_mean_squared_error
 from torch.utils.data import Dataset, TensorDataset, DataLoader
 from tqdm import tqdm
 
@@ -23,6 +21,7 @@ from models.fno import FNO
 from models.losses import LpLoss, H1Loss
 
 
+#########################################################
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
@@ -40,16 +39,8 @@ for directory in directories:
     datasets.append({'ax': ax,
                      'ux': ux})
 
-
-# In[6]:
-
-
 n_dataset = len(datasets)
 
-
-
-
-# In[8]:
 
 
 class DictDataset(Dataset):
@@ -66,10 +57,6 @@ class DictDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-
-
-
-# In[9]:
 
 
 def training_loop(model, train_dl, train_loss, optimizer, scheduler, n_epochs=500):
@@ -136,9 +123,6 @@ def training_loop(model, train_dl, train_loss, optimizer, scheduler, n_epochs=50
     return model
 
 
-# In[10]:
-
-
 def train_model(train_loader, n_modes=(16, 10), in_channels=2, hidden_channels=64, 
                  projection_channels=64, n_epochs=200):
     
@@ -170,21 +154,30 @@ def train_model(train_loader, n_modes=(16, 10), in_channels=2, hidden_channels=6
 
 
 
-
-
 def plot_results(ax, ux, ux_hat, filepath):
-    fig, axes = plt.subplots(1, 4, figsize=(16, 3))
+
+    # Extents
+    xmin, xmax = ax[0, 0].min(), ax[0].max()
+    ymin, ymax = ax[1, :, 0].min(), ax[1, :, 0].max()
+
+    fig, axes = plt.subplots(1, 4, figsize=(18, 3))
     
-    im = axes[0].imshow(ax[2], origin='lower')
+    im = axes[0].imshow(ax[2], extent=(xmin, xmax, ymin, ymax), origin='lower')
+    axes[0].set_title('$h(x)$')
     fig.colorbar(im, orientation='vertical')
     
-    im = axes[1].imshow(ax[3], origin='lower')
+    
+    im = axes[1].imshow(ax[3], extent=(xmin, xmax, ymin, ymax), origin='lower')
+    axes[1].set_title('$p(x)$')
     fig.colorbar(im, orientation='vertical')
     
-    im = axes[2].imshow(ux[0], origin='lower')
+    im = axes[2].imshow(ux[0], extent=(xmin, xmax, ymin, ymax), origin='lower')
+    axes[2].set_title('$\phi(x)$')
     fig.colorbar(im, orientation='vertical')
     
-    im = axes[3].imshow(ux_hat[0], origin='lower')
+    im = axes[3].imshow(ux_hat[0], vmax=ux.max(), vmin=ux.min(), 
+                        extent=(xmin, xmax, ymin, ymax), origin='lower')
+    axes[3].set_title('$\phi_{pred}(x)$')
     fig.colorbar(im, orientation='vertical')
 
     fig.savefig(filepath, bbox_inches='tight')
@@ -198,11 +191,12 @@ def validate(model, val_dataset, directory, interpolate=True):
     val_ux = val_dataset['ux']
     
     l2loss = LpLoss(d=2, p=2)
+    h1loss = H1Loss(d=2)
     
     with torch.no_grad():
         ϕx_hat = model(val_ax.to(device))
-        error = l2loss(ϕx_hat, val_ux.to(device))
-        print(error)
+        error = h1loss(ϕx_hat, val_ux.to(device))
+        print(f"Validation H1Loss: {error.item():.2f}")
 
     ϕx_hat = ϕx_hat.reshape((10, 10, 1, 32, 32))
 
@@ -220,7 +214,8 @@ def validate(model, val_dataset, directory, interpolate=True):
     val_ax = val_ax.reshape((10, 10, 4, 32, 32))[::2, ::2].numpy()
     val_ux = val_ux.reshape((10, 10, 1, 32, 32))[::2, ::2].numpy()
 
-    mse_error = np.square(ϕx_hat - val_ux).mean()
+    r2_error = r2_score(val_ux.flatten(), ϕx_hat.flatten())
+    rmse = root_mean_squared_error(val_ux.flatten(), ϕx_hat.flatten())
 
     # ux_hat
     ϕx_hat = np.concatenate([ϕx_hat[:, i] for i in range(5)], axis=-1)
@@ -237,7 +232,7 @@ def validate(model, val_dataset, directory, interpolate=True):
     # plot results
     plot_results(val_ax, val_ux, ϕx_hat, filepath=f'../plots/{directory}.png')
     
-    return error.item(), mse_error
+    return error.item(), r2_error, rmse
 
 
 res_list = []
@@ -252,27 +247,25 @@ for k in range(n_dataset):
     
     model = train_model(train_dl, in_channels=4, n_modes=(8, 8), n_epochs=1000)
     
-    l2_error, mse_error = validate(model, val_dataset, directory=directories[k], interpolate=True)
-    l2_error, mse_error_noint = validate(model, val_dataset, directory=f'{directories[k]}_noint',  interpolate=False)
+    h1_error, r2_error, rmse = validate(model, val_dataset, 
+                                        directory=directories[k], 
+                                        interpolate=True)
+    h1_error, r2_error_noint, rmse_noint = validate(model, val_dataset, 
+                                                    directory=f'{directories[k]}_noint',  
+                                                    interpolate=False)
 
     μ, σ = list(map(float, directories[k].split('_')))
     
     res = {'$\mu$': μ,
            '$\sigma$': σ,
-           'l2_error': l2_error,
-           'mse_int': mse_error,
-           'mse_noint': mse_error_noint}
+           'h1_error': h1_error,
+           'r2_int': r2_error,
+           'r2_noint': r2_error_noint,
+           'rmse_int': rmse,
+           'rmse_noint': rmse_noint}
     
     res_list.append(res)
 
 
-
-
 res_df = pd.DataFrame(res_list)
 res_df.to_csv('../results.csv', index=False)
-
-
-
-
-
-
