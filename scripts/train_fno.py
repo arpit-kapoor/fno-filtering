@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import datetime as dt
 
 from scipy.stats import norm, multivariate_normal
 from sklearn.metrics import r2_score, root_mean_squared_error
@@ -27,17 +28,28 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
 
 
-data_dir = '../data/'
+data_dir = '../data/2024-07-30/'
 directories = os.listdir(data_dir)
 datasets = []
 
 for directory in directories:
     ax_path = os.path.join(data_dir, directory, 'ax.pt')
     ux_path = os.path.join(data_dir, directory, 'ux_analytic.pt')
-    ax = torch.load(ax_path, map_location=torch.device('cpu'))
-    ux = torch.load(ux_path, map_location=torch.device('cpu'))
-    datasets.append({'ax': ax,
-                     'ux': ux})
+    hw_path = os.path.join(data_dir, directory, 'h_weights.pt')
+    hb_path = os.path.join(data_dir, directory, 'h_bias.pt')
+    
+    try:
+        ax = torch.load(ax_path, map_location=torch.device('cpu'))
+        ux = torch.load(ux_path, map_location=torch.device('cpu'))
+        hw = torch.load(hw_path, map_location=torch.device('cpu'))
+        hb = torch.load(hb_path, map_location=torch.device('cpu'))
+        datasets.append({'ax': ax,
+                         'ux': ux,
+                         'hw': hw,
+                         'hb': hb})
+    except Exception as e:
+        directories.remove(directory)
+        print(e)
 
 n_dataset = len(datasets)
 
@@ -153,6 +165,15 @@ def train_model(train_loader, n_modes=(16, 10), in_channels=2, hidden_channels=6
     return model
 
 
+def normalise(dataset, key, channel_mean=None, channel_std=None):
+    if channel_mean is None:
+        arr = dataset[key].permute(1, 0, 2, 3).flatten(1)
+        channel_mean = arr.mean(1)
+        channel_std = arr.std(1)
+    normalised_dataset = ((dataset[key].permute(0, 2, 3, 1) - channel_mean)/channel_std).permute(0, 3, 1, 2)
+    return normalised_dataset, channel_mean, channel_std
+
+
 
 def plot_results(ax, ux, ux_hat, filepath):
 
@@ -186,7 +207,7 @@ def plot_results(ax, ux, ux_hat, filepath):
 
 
 
-def validate(model, val_dataset, directory, interpolate=True):
+def validate(model, val_dataset, directory, ux_mean, ux_std, interpolate=True):
     val_ax = val_dataset['ax']
     val_ux = val_dataset['ux']
     
@@ -214,8 +235,12 @@ def validate(model, val_dataset, directory, interpolate=True):
     val_ax = val_ax.reshape((10, 10, 4, 32, 32))[::2, ::2].numpy()
     val_ux = val_ux.reshape((10, 10, 1, 32, 32))[::2, ::2].numpy()
 
-    r2_error = r2_score(val_ux.flatten(), ϕx_hat.flatten())
-    rmse = root_mean_squared_error(val_ux.flatten(), ϕx_hat.flatten())
+
+    ux_unscaled = val_ux.flatten() * ux_std.numpy()[0] + ux_mean.numpy()[0]
+    ux_hat_unscaled = ϕx_hat.flatten() * ux_std.numpy()[0] + ux_mean.numpy()[0]
+
+    r2_error = r2_score(ux_unscaled, ux_hat_unscaled)
+    rmse = root_mean_squared_error(ux_unscaled, ux_hat_unscaled)
 
     # ux_hat
     ϕx_hat = np.concatenate([ϕx_hat[:, i] for i in range(5)], axis=-1)
@@ -230,7 +255,8 @@ def validate(model, val_dataset, directory, interpolate=True):
     val_ux = np.concatenate([val_ux[i] for i in range(5)], axis=-2)
 
     # plot results
-    plot_results(val_ax, val_ux, ϕx_hat, filepath=f'../plots/{directory}.png')
+    os.makedirs(f'../plots/{str(dt.date.today())}', exist_ok=True)
+    plot_results(val_ax, val_ux, ϕx_hat, filepath=f'../plots/{str(dt.date.today())}/{directory}.png')
     
     return error.item(), r2_error, rmse
 
@@ -242,6 +268,13 @@ for k in range(n_dataset):
     train_dataset['ux'] = torch.concat([datasets[i]['ux'] for i in range(n_dataset) if i!=k], dim=0)
     val_dataset = datasets[k]
     
+    # Normalise
+    train_dataset['ax'], ax_channel_mean, ax_channel_std = normalise(train_dataset, 'ax')
+    train_dataset['ux'], ux_channel_mean, ux_channel_std = normalise(train_dataset, 'ux')
+
+    val_dataset['ax'], _, _ = normalise(val_dataset, 'ax', ax_channel_mean, ax_channel_std)
+    val_dataset['ux'], _, _ = normalise(val_dataset, 'ux', ux_channel_mean, ux_channel_std)
+    
     train_ds = DictDataset(train_dataset['ax'], train_dataset['ux'])
     train_dl = DataLoader(train_ds, batch_size=256, shuffle=True)
     
@@ -249,9 +282,13 @@ for k in range(n_dataset):
     
     h1_error, r2_error, rmse = validate(model, val_dataset, 
                                         directory=directories[k], 
+                                        ux_mean=ux_channel_mean,
+                                        ux_std=ux_channel_std,
                                         interpolate=True)
     h1_error, r2_error_noint, rmse_noint = validate(model, val_dataset, 
-                                                    directory=f'{directories[k]}_noint',  
+                                                    directory=f'{directories[k]}_noint',
+                                                    ux_mean=ux_channel_mean,
+                                                    ux_std=ux_channel_std,
                                                     interpolate=False)
 
     μ, σ = list(map(float, directories[k].split('_')))
@@ -262,10 +299,13 @@ for k in range(n_dataset):
            'r2_int': r2_error,
            'r2_noint': r2_error_noint,
            'rmse_int': rmse,
-           'rmse_noint': rmse_noint}
+           'rmse_noint': rmse_noint,
+           'w1': val_dataset['hw'].flatten().numpy().tolist()[0],
+           'w2': val_dataset['hw'].flatten().numpy().tolist()[1],
+           'w0': val_dataset['hb'].flatten().numpy().tolist()[0]}
     
     res_list.append(res)
 
 
 res_df = pd.DataFrame(res_list)
-res_df.to_csv('../results.csv', index=False)
+res_df.to_csv(f'../results_{str(dt.date.today())}.csv', index=False)
